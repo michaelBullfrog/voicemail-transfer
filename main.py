@@ -4,6 +4,7 @@ import logging
 import os
 from datetime import datetime, timezone
 from typing import Any
+from zoneinfo import ZoneInfo
 
 import httpx
 from fastapi import FastAPI, Header, HTTPException, Query, Request
@@ -19,6 +20,34 @@ app = FastAPI()
 # Temporary storage for testing.
 # This resets whenever Render restarts or redeploys.
 last_request: dict[str, Any] = {}
+
+
+def format_notification_timestamp(received_at: datetime) -> str:
+    """
+    Converts the UTC received timestamp into the configured local timezone.
+
+    Render environment variable example:
+    MAIL_TIMEZONE=America/New_York
+    """
+    timezone_name = os.getenv(
+        "MAIL_TIMEZONE",
+        "America/New_York",
+    )
+
+    try:
+        local_timezone = ZoneInfo(timezone_name)
+    except Exception:
+        logger.warning(
+            "Invalid MAIL_TIMEZONE '%s'; using UTC.",
+            timezone_name,
+        )
+        local_timezone = timezone.utc
+
+    local_time = received_at.astimezone(local_timezone)
+
+    return local_time.strftime(
+        "%B %d, %Y at %I:%M:%S %p %Z"
+    )
 
 
 def get_telephony_state(agent: dict[str, Any]) -> str:
@@ -195,6 +224,7 @@ async def get_graph_access_token() -> str:
 async def send_voicemail_email(
     caller_number: str | None,
     agents: list[dict[str, str]],
+    received_at: datetime,
 ) -> None:
     sender = os.getenv("MAIL_SENDER")
     recipient = os.getenv("MAIL_RECIPIENT")
@@ -208,6 +238,10 @@ async def send_voicemail_email(
 
     caller_display = html.escape(
         caller_number or "Unknown caller"
+    )
+
+    timestamp_display = html.escape(
+        format_notification_timestamp(received_at)
     )
 
     agent_table = build_agent_table(agents)
@@ -225,6 +259,11 @@ async def send_voicemail_email(
             <p>
                 <strong>Caller:</strong>
                 {caller_display}
+            </p>
+
+            <p>
+                <strong>Timestamp:</strong>
+                {timestamp_display}
             </p>
 
             <p>
@@ -285,9 +324,10 @@ async def send_voicemail_email(
 
     logger.info(
         "Voicemail email accepted by Microsoft Graph | "
-        "sender=%s | recipient=%s",
+        "sender=%s | recipient=%s | timestamp=%s",
         sender,
         recipient,
+        timestamp_display,
     )
 
 
@@ -325,6 +365,7 @@ async def receive_voicemail_transfer(
         )
 
     received_at = datetime.now(timezone.utc)
+    timestamp_display = format_notification_timestamp(received_at)
 
     raw_body_bytes = await request.body()
     raw_body = raw_body_bytes.decode(
@@ -361,6 +402,7 @@ async def receive_voicemail_transfer(
         interaction_id
         or parsed_payload.get("interactionId")
     )
+
     caller_number = (
         caller_number
         or parsed_payload.get("callerNumber")
@@ -369,6 +411,7 @@ async def receive_voicemail_transfer(
     search_status_code = parsed_payload.get(
         "searchStatusCode"
     )
+
     search_response_body = parsed_payload.get(
         "searchResponseBody"
     )
@@ -382,7 +425,8 @@ async def receive_voicemail_transfer(
     )
 
     last_request = {
-        "receivedAt": received_at.isoformat(),
+        "receivedAtUtc": received_at.isoformat(),
+        "receivedAtLocal": timestamp_display,
         "interactionId": interaction_id,
         "callerNumber": caller_number,
         "searchStatusCode": search_status_code,
@@ -392,16 +436,18 @@ async def receive_voicemail_transfer(
 
     logger.info(
         "Voicemail notification received | "
-        "interaction=%s | caller=%s | agents=%s",
+        "interaction=%s | caller=%s | agents=%s | timestamp=%s",
         interaction_id,
         caller_number,
         len(formatted_agents),
+        timestamp_display,
     )
 
     try:
         await send_voicemail_email(
             caller_number=caller_number,
             agents=formatted_agents,
+            received_at=received_at,
         )
     except RuntimeError as exc:
         logger.exception(
@@ -409,13 +455,13 @@ async def receive_voicemail_transfer(
         )
 
         # Return 200 so the caller still continues to voicemail.
-        # The response records that email delivery failed.
         return {
             "accepted": True,
             "emailSent": False,
             "emailError": str(exc),
             "interactionId": interaction_id,
             "agentCount": len(formatted_agents),
+            "timestamp": timestamp_display,
         }
 
     return {
@@ -426,4 +472,5 @@ async def receive_voicemail_transfer(
         "agentCount": len(formatted_agents),
         "agents": formatted_agents,
         "receivedAt": received_at.isoformat(),
+        "timestamp": timestamp_display,
     }

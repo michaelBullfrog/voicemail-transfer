@@ -50,21 +50,104 @@ def format_notification_timestamp(received_at: datetime) -> str:
     )
 
 
+def format_state_name(state: str) -> str:
+    """
+    Converts Webex Contact Center state names into readable labels.
+    """
+    normalized_state = state.strip().lower()
+
+    state_mapping = {
+        "engaged": "Engaged",
+        "connected": "Engaged",
+        "ringing": "Ringing",
+        "consulting": "Consulting",
+        "consult": "Consulting",
+        "wrapup": "Wrap Up",
+        "wrap_up": "Wrap Up",
+        "aftercallwork": "After Call Work",
+        "after_call_work": "After Call Work",
+        "rona": "RONA",
+        "notresponding": "RONA",
+        "not_responding": "RONA",
+        "available": "Available",
+        "idle": "Idle",
+    }
+
+    return state_mapping.get(
+        normalized_state,
+        normalized_state.replace("_", " ").title(),
+    )
+
+
 def get_telephony_state(agent: dict[str, Any]) -> str:
+    """
+    Returns the most meaningful current telephony state.
+
+    The API may return multiple telephony entries, including entries
+    whose currentState is null. Blank values are ignored and active
+    states such as Engaged are preferred over Idle.
+    """
     channel_info = agent.get("channelInfo", [])
 
     if not isinstance(channel_info, list):
         return "Unknown"
 
+    telephony_states: list[str] = []
+
     for channel in channel_info:
         if not isinstance(channel, dict):
             continue
 
-        if str(channel.get("channelType", "")).lower() == "telephony":
-            state = str(channel.get("currentState", "Unknown"))
-            return state.replace("_", " ").title()
+        channel_type = str(
+            channel.get("channelType") or ""
+        ).strip().lower()
 
-    return "Unknown"
+        if channel_type != "telephony":
+            continue
+
+        current_state = channel.get("currentState")
+
+        # Ignore null and blank state values.
+        if current_state is None:
+            continue
+
+        state_text = str(current_state).strip()
+
+        if not state_text:
+            continue
+
+        if state_text.lower() in {"none", "null"}:
+            continue
+
+        telephony_states.append(state_text.lower())
+
+    if not telephony_states:
+        return "Unknown"
+
+    # Prefer active states over passive states if multiple
+    # telephony channel records are returned.
+    state_priority = [
+        "engaged",
+        "connected",
+        "ringing",
+        "consulting",
+        "consult",
+        "wrapup",
+        "wrap_up",
+        "aftercallwork",
+        "after_call_work",
+        "rona",
+        "notresponding",
+        "not_responding",
+        "available",
+        "idle",
+    ]
+
+    for preferred_state in state_priority:
+        if preferred_state in telephony_states:
+            return format_state_name(preferred_state)
+
+    return format_state_name(telephony_states[0])
 
 
 def extract_agent_sessions(
@@ -96,11 +179,21 @@ def format_agents(
     formatted_agents: list[dict[str, str]] = []
 
     for agent in agent_sessions:
+        agent_name = str(
+            agent.get("agentName") or "Unknown Agent"
+        )
+
+        # Temporary diagnostic log so we can inspect exactly
+        # what Webex returns while the agent is on a call or in RONA.
+        logger.info(
+            "Raw channelInfo for agent %s: %s",
+            agent_name,
+            agent.get("channelInfo"),
+        )
+
         formatted_agents.append(
             {
-                "agentName": str(
-                    agent.get("agentName") or "Unknown Agent"
-                ),
+                "agentName": agent_name,
                 "state": get_telephony_state(agent),
             }
         )
@@ -441,6 +534,11 @@ async def receive_voicemail_transfer(
         caller_number,
         len(formatted_agents),
         timestamp_display,
+    )
+
+    logger.info(
+        "Formatted agent states: %s",
+        formatted_agents,
     )
 
     try:

@@ -1,9 +1,11 @@
+import html
 import json
 import logging
 import os
 from datetime import datetime, timezone
 from typing import Any
 
+import httpx
 from fastapi import FastAPI, Header, HTTPException, Query, Request
 
 logging.basicConfig(
@@ -20,81 +22,273 @@ last_request: dict[str, Any] = {}
 
 
 def get_telephony_state(agent: dict[str, Any]) -> str:
-    """
-    Returns the agent's current telephony state.
-
-    The Search API may return multiple chat and email channel records,
-    so only the telephony channel is used for this notification.
-    """
     channel_info = agent.get("channelInfo", [])
 
     if not isinstance(channel_info, list):
-        return "unknown"
+        return "Unknown"
 
     for channel in channel_info:
         if not isinstance(channel, dict):
             continue
 
-        channel_type = str(channel.get("channelType", "")).lower()
+        if str(channel.get("channelType", "")).lower() == "telephony":
+            state = str(channel.get("currentState", "Unknown"))
+            return state.replace("_", " ").title()
 
-        if channel_type == "telephony":
-            return str(channel.get("currentState", "unknown"))
-
-    return "unknown"
+    return "Unknown"
 
 
 def extract_agent_sessions(
     search_response_body: Any,
 ) -> list[dict[str, Any]]:
-    """
-    Extracts agentSessions from the Webex Contact Center Search API response.
-    """
     if not isinstance(search_response_body, dict):
         return []
 
-    data = search_response_body.get("data")
+    sessions = (
+        search_response_body
+        .get("data", {})
+        .get("agentSession", {})
+        .get("agentSessions", [])
+    )
 
-    if not isinstance(data, dict):
-        return []
-
-    agent_session = data.get("agentSession")
-
-    if not isinstance(agent_session, dict):
-        return []
-
-    agent_sessions = agent_session.get("agentSessions", [])
-
-    if not isinstance(agent_sessions, list):
+    if not isinstance(sessions, list):
         return []
 
     return [
         agent
-        for agent in agent_sessions
+        for agent in sessions
         if isinstance(agent, dict)
     ]
 
 
 def format_agents(
     agent_sessions: list[dict[str, Any]],
-) -> list[dict[str, Any]]:
-    """
-    Converts the raw Search API agent-session records into a cleaner list.
-    """
-    formatted_agents: list[dict[str, Any]] = []
+) -> list[dict[str, str]]:
+    formatted_agents: list[dict[str, str]] = []
 
     for agent in agent_sessions:
         formatted_agents.append(
             {
-                "agentId": agent.get("agentId"),
-                "agentName": agent.get("agentName"),
-                "teamId": agent.get("teamId"),
-                "teamName": agent.get("teamName"),
-                "isActive": bool(agent.get("isActive")),
-                "telephonyState": get_telephony_state(agent),
+                "agentName": str(
+                    agent.get("agentName") or "Unknown Agent"
+                ),
+                "state": get_telephony_state(agent),
             }
         )
 
     return formatted_agents
+
+
+def build_agent_table(
+    agents: list[dict[str, str]],
+) -> str:
+    if not agents:
+        return """
+        <p>No active Contact Center agents were returned.</p>
+        """
+
+    rows = ""
+
+    for agent in agents:
+        agent_name = html.escape(agent["agentName"])
+        state = html.escape(agent["state"])
+
+        rows += f"""
+        <tr>
+            <td style="
+                padding: 8px 12px;
+                border: 1px solid #d9d9d9;
+            ">
+                {agent_name}
+            </td>
+            <td style="
+                padding: 8px 12px;
+                border: 1px solid #d9d9d9;
+            ">
+                {state}
+            </td>
+        </tr>
+        """
+
+    return f"""
+    <table style="
+        border-collapse: collapse;
+        font-family: Arial, sans-serif;
+        min-width: 360px;
+    ">
+        <thead>
+            <tr>
+                <th style="
+                    padding: 8px 12px;
+                    border: 1px solid #d9d9d9;
+                    text-align: left;
+                    background-color: #f2f2f2;
+                ">
+                    Agent
+                </th>
+                <th style="
+                    padding: 8px 12px;
+                    border: 1px solid #d9d9d9;
+                    text-align: left;
+                    background-color: #f2f2f2;
+                ">
+                    State
+                </th>
+            </tr>
+        </thead>
+        <tbody>
+            {rows}
+        </tbody>
+    </table>
+    """
+
+
+async def get_graph_access_token() -> str:
+    tenant_id = os.getenv("MS_TENANT_ID")
+    client_id = os.getenv("MS_CLIENT_ID")
+    client_secret = os.getenv("MS_CLIENT_SECRET")
+
+    if not tenant_id or not client_id or not client_secret:
+        raise RuntimeError(
+            "Microsoft Graph credentials are not configured."
+        )
+
+    token_url = (
+        f"https://login.microsoftonline.com/"
+        f"{tenant_id}/oauth2/v2.0/token"
+    )
+
+    token_data = {
+        "client_id": client_id,
+        "client_secret": client_secret,
+        "scope": "https://graph.microsoft.com/.default",
+        "grant_type": "client_credentials",
+    }
+
+    async with httpx.AsyncClient(timeout=15) as client:
+        response = await client.post(
+            token_url,
+            data=token_data,
+        )
+
+    if response.status_code != 200:
+        logger.error(
+            "Graph token request failed | status=%s | body=%s",
+            response.status_code,
+            response.text,
+        )
+        raise RuntimeError(
+            "Unable to obtain Microsoft Graph access token."
+        )
+
+    token_payload = response.json()
+    access_token = token_payload.get("access_token")
+
+    if not access_token:
+        raise RuntimeError(
+            "Microsoft Graph did not return an access token."
+        )
+
+    return access_token
+
+
+async def send_voicemail_email(
+    caller_number: str | None,
+    agents: list[dict[str, str]],
+) -> None:
+    sender = os.getenv("MAIL_SENDER")
+    recipient = os.getenv("MAIL_RECIPIENT")
+
+    if not sender or not recipient:
+        raise RuntimeError(
+            "MAIL_SENDER and MAIL_RECIPIENT must be configured."
+        )
+
+    access_token = await get_graph_access_token()
+
+    caller_display = html.escape(
+        caller_number or "Unknown caller"
+    )
+
+    agent_table = build_agent_table(agents)
+
+    subject = f"Call transferred to voicemail - {caller_display}"
+
+    email_body = f"""
+    <html>
+        <body style="
+            font-family: Arial, sans-serif;
+            color: #222222;
+        ">
+            <h2>Call Transferred to Voicemail</h2>
+
+            <p>
+                <strong>Caller:</strong>
+                {caller_display}
+            </p>
+
+            <p>
+                Contact Center agent states at the time
+                of the voicemail transfer:
+            </p>
+
+            {agent_table}
+        </body>
+    </html>
+    """
+
+    graph_url = (
+        "https://graph.microsoft.com/v1.0/"
+        f"users/{sender}/sendMail"
+    )
+
+    graph_payload = {
+        "message": {
+            "subject": subject,
+            "body": {
+                "contentType": "HTML",
+                "content": email_body,
+            },
+            "toRecipients": [
+                {
+                    "emailAddress": {
+                        "address": recipient,
+                    }
+                }
+            ],
+        },
+        "saveToSentItems": True,
+    }
+
+    headers = {
+        "Authorization": f"Bearer {access_token}",
+        "Content-Type": "application/json",
+    }
+
+    async with httpx.AsyncClient(timeout=20) as client:
+        response = await client.post(
+            graph_url,
+            headers=headers,
+            json=graph_payload,
+        )
+
+    if response.status_code != 202:
+        logger.error(
+            "Graph sendMail failed | status=%s | body=%s",
+            response.status_code,
+            response.text,
+        )
+        raise RuntimeError(
+            f"Microsoft Graph sendMail failed with "
+            f"status {response.status_code}."
+        )
+
+    logger.info(
+        "Voicemail email accepted by Microsoft Graph | "
+        "sender=%s | recipient=%s",
+        sender,
+        recipient,
+    )
 
 
 @app.get("/")
@@ -104,12 +298,6 @@ async def health_check() -> dict[str, str]:
 
 @app.get("/api/wxcc/last-payload")
 async def view_last_payload() -> dict[str, Any]:
-    """
-    Temporary testing endpoint.
-
-    Open:
-    https://YOUR-SERVICE.onrender.com/api/wxcc/last-payload
-    """
     return last_request
 
 
@@ -123,26 +311,6 @@ async def receive_voicemail_transfer(
     caller_number: str | None = Query(
         default=None,
         alias="callerNumber",
-    ),
-    dialed_number: str | None = Query(
-        default=None,
-        alias="dialedNumber",
-    ),
-    queue_id: str | None = Query(
-        default=None,
-        alias="queueId",
-    ),
-    queue_name: str | None = Query(
-        default=None,
-        alias="queueName",
-    ),
-    voicemail_destination: str | None = Query(
-        default=None,
-        alias="voicemailDestination",
-    ),
-    voicemail_reason: str | None = Query(
-        default=None,
-        alias="voicemailReason",
     ),
     x_flow_secret: str | None = Header(default=None),
 ) -> dict[str, Any]:
@@ -158,7 +326,6 @@ async def receive_voicemail_transfer(
 
     received_at = datetime.now(timezone.utc)
 
-    # Read the body exactly as Flow Designer sent it.
     raw_body_bytes = await request.body()
     raw_body = raw_body_bytes.decode(
         "utf-8",
@@ -174,48 +341,37 @@ async def receive_voicemail_transfer(
         except json.JSONDecodeError as exc:
             json_parse_error = str(exc)
 
-    # Flow Designer is currently sending these values in the JSON body.
-    # Use the body values when no query parameter was provided.
-    if isinstance(parsed_payload, dict):
-        interaction_id = (
-            interaction_id
-            or parsed_payload.get("interactionId")
+    if json_parse_error:
+        logger.error(
+            "Invalid JSON received from Flow Designer: %s",
+            json_parse_error,
         )
-        caller_number = (
-            caller_number
-            or parsed_payload.get("callerNumber")
-        )
-        dialed_number = (
-            dialed_number
-            or parsed_payload.get("dialedNumber")
-        )
-        queue_id = (
-            queue_id
-            or parsed_payload.get("queueId")
-        )
-        queue_name = (
-            queue_name
-            or parsed_payload.get("queueName")
-        )
-        voicemail_destination = (
-            voicemail_destination
-            or parsed_payload.get("voicemailDestination")
-        )
-        voicemail_reason = (
-            voicemail_reason
-            or parsed_payload.get("voicemailReason")
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid JSON request body.",
         )
 
-    search_status_code = None
-    search_response_body: Any = None
+    if not isinstance(parsed_payload, dict):
+        raise HTTPException(
+            status_code=400,
+            detail="A JSON object is required.",
+        )
 
-    if isinstance(parsed_payload, dict):
-        search_status_code = parsed_payload.get(
-            "searchStatusCode"
-        )
-        search_response_body = parsed_payload.get(
-            "searchResponseBody"
-        )
+    interaction_id = (
+        interaction_id
+        or parsed_payload.get("interactionId")
+    )
+    caller_number = (
+        caller_number
+        or parsed_payload.get("callerNumber")
+    )
+
+    search_status_code = parsed_payload.get(
+        "searchStatusCode"
+    )
+    search_response_body = parsed_payload.get(
+        "searchResponseBody"
+    )
 
     agent_sessions = extract_agent_sessions(
         search_response_body
@@ -225,86 +381,49 @@ async def receive_voicemail_transfer(
         agent_sessions
     )
 
-    request_details = {
+    last_request = {
         "receivedAt": received_at.isoformat(),
         "interactionId": interaction_id,
         "callerNumber": caller_number,
-        "dialedNumber": dialed_number,
-        "queueId": queue_id,
-        "queueName": queue_name,
-        "voicemailDestination": voicemail_destination,
-        "voicemailReason": voicemail_reason,
-        "contentType": request.headers.get(
-            "content-type"
-        ),
         "searchStatusCode": search_status_code,
-        "searchResponseBody": search_response_body,
         "agentCount": len(formatted_agents),
         "agents": formatted_agents,
-        "rawBody": raw_body,
-        "jsonParseError": json_parse_error,
     }
 
-    last_request = request_details
-
     logger.info(
-        "Voicemail transfer received | "
-        "interaction=%s | caller=%s | dialed=%s | "
-        "queueId=%s | queueName=%s | "
-        "destination=%s | reason=%s",
+        "Voicemail notification received | "
+        "interaction=%s | caller=%s | agents=%s",
         interaction_id,
         caller_number,
-        dialed_number,
-        queue_id,
-        queue_name,
-        voicemail_destination,
-        voicemail_reason,
+        len(formatted_agents),
     )
 
-    logger.info(
-        "Search status code: %s",
-        search_status_code,
-    )
-
-    logger.info(
-        "Agent session count: %s",
-        len(agent_sessions),
-    )
-
-    logger.info(
-        "Formatted agents: %s",
-        formatted_agents,
-    )
-
-    print(
-        "FORMATTED AGENTS:",
-        formatted_agents,
-        flush=True,
-    )
-
-    if json_parse_error:
-        logger.warning(
-            "JSON parsing failed: %s",
-            json_parse_error,
+    try:
+        await send_voicemail_email(
+            caller_number=caller_number,
+            agents=formatted_agents,
         )
+    except RuntimeError as exc:
+        logger.exception(
+            "Unable to send voicemail notification email."
+        )
+
+        # Return 200 so the caller still continues to voicemail.
+        # The response records that email delivery failed.
+        return {
+            "accepted": True,
+            "emailSent": False,
+            "emailError": str(exc),
+            "interactionId": interaction_id,
+            "agentCount": len(formatted_agents),
+        }
 
     return {
         "accepted": True,
+        "emailSent": True,
         "interactionId": interaction_id,
         "callerNumber": caller_number,
-        "dialedNumber": dialed_number,
-        "queueId": queue_id,
-        "queueName": queue_name,
-        "voicemailDestination": voicemail_destination,
-        "voicemailReason": voicemail_reason,
-        "receivedAt": received_at.isoformat(),
-        "bodyReceived": bool(raw_body.strip()),
-        "jsonParsed": (
-            parsed_payload is not None
-            and json_parse_error is None
-        ),
-        "searchStatusCode": search_status_code,
         "agentCount": len(formatted_agents),
         "agents": formatted_agents,
-        "jsonParseError": json_parse_error,
+        "receivedAt": received_at.isoformat(),
     }
